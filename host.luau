@@ -57,6 +57,7 @@ type State = {
 	-- derived per render
 	rows: { Row },
 	newest_path: string?,
+	parse_token: number, -- bumps per parse chain; stale chains abort
 }
 
 local function fresh(): State
@@ -86,6 +87,7 @@ local function fresh(): State
 		stats = nil,
 		rows = {},
 		newest_path = nil,
+		parse_token = 0,
 	}
 end
 
@@ -252,55 +254,130 @@ local function round_count(st: State): number
 	return n
 end
 
-local function apply_text(pane: number, st: State, text: string, base_byte: number, mode: "replace" | "prepend")
-	local lines = Parse.split(text)
-	local parsed = Parse.lines(lines)
+local PARSE_BATCH = 120 -- lines per chained callback (~25 ms; the 2 s budget
+-- is wall-clock and one contended spike once disabled the whole hook, so
+-- every callback stays small by construction)
 
-	if mode == "replace" then
-		st.entries = parsed.entries
-		st.bad = parsed.bad
-		st.rounds = Query.rounds(st.entries)
-		st.win_from = Query.tail_from(st.rounds, TAIL_ROUNDS)
-		st.stats = Query.stats(st.entries, round_count(st))
-		st.follow = true
-	else
+--- Parses `text` in small chained callbacks, then applies it to the state.
+--- Stale chains (a newer open/reload) abort themselves via parse_token.
+local function start_parse(
+	pane: number,
+	text: string,
+	base_byte: number,
+	mode: "replace" | "prepend",
+	pin_tail: boolean?
+)
+	local r = reg[pane]
+	if r == nil then
+		return
+	end
+	local st = r.st
+	local lines = Parse.split(text)
+	local acc = Parse.acc()
+	local anchor_id: string? = nil
+	if mode == "prepend" then
 		local anchor = st.rows[st.sel]
-		local anchor_id = if anchor then anchor.id else nil
-		local rounds_before = #st.rounds
-		local merged: { Entry } = tern.json.array({})
-		for _, e in parsed.entries do
-			table.insert(merged, e)
+		anchor_id = if anchor then anchor.id else nil
+	end
+	st.parse_token += 1
+	local token = st.parse_token
+	local pos = 0
+
+	local function finish()
+		local r = reg[pane]
+		if r == nil or r.st.parse_token ~= token then
+			return
 		end
-		for _, e in st.entries do
-			table.insert(merged, e)
-		end
-		st.entries = merged
-		st.bad += parsed.bad
-		st.rounds = Query.rounds(st.entries)
-		st.win_from = math.max(1, st.win_from + (#st.rounds - rounds_before))
-		st.stats = Query.stats(st.entries, round_count(st))
-		-- Re-anchor the cursor onto the row it was on.
-		local win: { Round } = {}
-		for i = st.win_from, #st.rounds do
-			table.insert(win, st.rounds[i])
-		end
-		st.rows = View.build_rows(win, st.filter)
-		if st.follow then
-			st.sel = #st.rows
-		elseif anchor_id ~= nil then
-			st.sel = 1
-			for i, row in st.rows do
-				if row.id == anchor_id then
-					st.sel = i
-					break
+		local st = r.st
+		local f0 = tern.now()
+		local parsed = Parse.finish(acc)
+		local f1 = tern.now()
+		if mode == "replace" then
+			st.entries = parsed.entries
+			st.bad = parsed.bad
+			st.rounds = Query.rounds(st.entries)
+			st.win_from = Query.tail_from(st.rounds, TAIL_ROUNDS)
+			st.stats = Query.stats(st.entries, round_count(st))
+			st.follow = true
+		else
+			local rounds_before2 = #st.rounds
+			local merged: { Entry } = tern.json.array({})
+			for _, e in parsed.entries do
+				table.insert(merged, e)
+			end
+			for _, e in st.entries do
+				table.insert(merged, e)
+			end
+			st.entries = merged
+			st.bad += parsed.bad
+			local f2 = tern.now()
+			st.rounds = Query.rounds(st.entries)
+			local f3 = tern.now()
+			if pin_tail and st.follow then
+				st.win_from = Query.tail_from(st.rounds, TAIL_ROUNDS)
+			else
+				st.win_from = math.max(1, st.win_from + (#st.rounds - rounds_before2))
+			end
+			st.stats = Query.stats(st.entries, round_count(st))
+			local f4 = tern.now()
+			local win: { Round } = {}
+			for i = st.win_from, #st.rounds do
+				table.insert(win, st.rounds[i])
+			end
+			st.rows = View.build_rows(win, st.filter)
+			local f5 = tern.now()
+			tern.log.warn(
+				"probe finish",
+				mode,
+				math.floor((f1 - f0) * 1),
+				math.floor(f2 - f1),
+				math.floor(f3 - f2),
+				math.floor(f4 - f3),
+				math.floor(f5 - f4),
+				"ms"
+			)
+			if st.follow then
+				st.sel = #st.rows
+			elseif anchor_id ~= nil then
+				st.sel = 1
+				for i, row in st.rows do
+					if row.id == anchor_id then
+						st.sel = i
+						break
+					end
 				end
 			end
 		end
+		-- Byte offset after the last complete line (a trailing partial line
+		-- is reparsed on the next watch tick).
+		st.stream_upto = (base_byte - 1) + last_newline(text)
+		st.loading = false
+		render(pane)
 	end
 
-	-- Byte offset after the last complete line we parsed (the stream resumes
-	-- there; a trailing partial line is reparsed on the next tick).
-	st.stream_upto = (base_byte - 1) + last_newline(text)
+	local function tick()
+		local r = reg[pane]
+		if r == nil or r.st.parse_token ~= token then
+			return -- superseded by a newer open/reload, or block gone
+		end
+		local from = pos + 1
+		local to = math.min(#lines, from + PARSE_BATCH - 1)
+		for i = from, to do
+			Parse.push(acc, lines[i])
+		end
+		pos = to
+		if pos < #lines then
+			tern.timer(0, tick)
+		else
+			finish()
+		end
+	end
+
+	if #lines == 0 then
+		finish()
+	else
+		tern.timer(0, tick)
+	end
 end
 
 local function drop_first_line(text: string): string
@@ -322,17 +399,22 @@ local function load_tail(pane: number)
 	st.truncated = from > 1
 	st.loading = true
 	if from <= 1 then
-		-- Small file: synchronous read inside the worker budget.
-		local ok, text = pcall(tern.fs.read, path)
-		st.loading = false
-		if not ok then
-			st.error = tostring(text)
+		-- Small file: read off-thread like every other path so no callback
+		-- ever pays for disk IO.
+		tern.process.run({ "cat", path }, { timeout_ms = 8000 }, function(res)
+			local r = reg[pane]
+			if r == nil or r.st.path ~= path then
+				return
+			end
+			r.st.loading = false
+			if res.status ~= 0 then
+				r.st.error = "read failed: " .. res.stderr
+			else
+				r.st.error = nil
+				start_parse(pane, res.stdout, 1, "replace")
+			end
 			render(pane)
-			return
-		end
-		st.error = nil
-		apply_text(pane, st, text :: string, 1, "replace")
-		render(pane)
+		end)
 		return
 	end
 	tern.process.run({ "tail", "-c", "+" .. tostring(from), path }, { timeout_ms = 8000 }, function(res)
@@ -345,7 +427,7 @@ local function load_tail(pane: number)
 			r.st.error = "read failed: " .. res.stderr
 		else
 			r.st.error = nil
-			apply_text(pane, r.st, drop_first_line(res.stdout), from, "replace")
+			start_parse(pane, drop_first_line(res.stdout), from, "replace")
 		end
 		render(pane)
 	end)
@@ -413,7 +495,7 @@ local function load_earlier(pane: number)
 		end
 		r.st.loading = false
 		if res.status ~= 0 then
-			r.st.error = "load earlier failed: " .. res.stderr
+			r.st.error = "read failed: " .. res.stderr
 		else
 			r.st.error = nil
 			r.st.loaded_from = a
@@ -422,9 +504,10 @@ local function load_earlier(pane: number)
 			if a > 1 then
 				text = drop_first_line(text)
 			end
-			apply_text(pane, r.st, text, a, "prepend")
+			-- BISECTION 3: state flip + parse chain, NO render here (the
+			-- chain's finish renders once)
+			start_parse(pane, text, a, "prepend")
 		end
-		render(pane)
 	end)
 end
 
@@ -473,10 +556,7 @@ schedule_watch = function(pane: number)
 						end
 						if res.status == 0 then
 							r.st.file_size = size
-							apply_text(pane, r.st, res.stdout, from, "prepend")
-							if r.st.follow then
-								r.st.win_from = Query.tail_from(r.st.rounds, TAIL_ROUNDS)
-							end
+							start_parse(pane, res.stdout, from, "prepend", true)
 						end
 						render(pane)
 					end)
@@ -597,6 +677,12 @@ local function key_view(st: State, key: Key, cx: BlockCx): boolean?
 	elseif bare and key.name == "f" then
 		st.filter_edit = true
 		st.filter_buf = st.filter or ""
+	elseif bare and (key.name == "h" or key.name == "left") then
+		if st.truncated then
+			load_earlier(cx.pane)
+		else
+			return false
+		end
 	elseif bare and key.name == "q" then
 		cx:exit(0)
 	else
@@ -705,6 +791,8 @@ local function dock_view(st: State): Node
 		if st.mode == "view" then
 			add("f", "")
 			add(" filter" .. (if st.filter ~= nil then " (" .. (st.filter :: string) .. ")" else "") .. " · ", "muted")
+			add("h", "")
+			add(if st.truncated then " earlier · " else " · ", "muted")
 			add("r", "")
 			add(" reload · ", "muted")
 			add("esc", "")
@@ -816,12 +904,9 @@ local function traj_view(st: State, cx: BlockCx): BlockView
 			end
 		end
 	end
-	return { main = ui.col(children), dock = dock_view(st) }
+	local dock = dock_view(st)
+	return { main = ui.col(children), dock = dock }
 end
-
----------------------------------------------------------------------
--- Block definition
----------------------------------------------------------------------
 
 local block: BlockDef<State> = {
 	init = function(cx, _args, saved)

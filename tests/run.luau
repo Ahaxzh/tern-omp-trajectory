@@ -257,6 +257,23 @@ eq("B: user rounds", user_rounds_b, 11)
 local lb = Parse.split(Fixtures.B_text)
 eq("B: split line count", #lb, 174)
 
+-- Accumulator batching must equal one-shot parsing (budget-chained path)
+local acc = Parse.acc()
+local linesA = Parse.split(Fixtures.A_text)
+for i = 1, #linesA, 97 do
+	local to = math.min(#linesA, i + 96)
+	for j = i, to do
+		Parse.push(acc, linesA[j])
+	end
+end
+local fa2 = Parse.finish(acc)
+local ka2 = classify(fa2.entries)
+eq("acc: users", ka2.user, 18)
+eq("acc: assistants", ka2.assistant, 132)
+eq("acc: tools", ka2.tool, 156)
+eq("acc: total", #fa2.entries, 353)
+eq("acc: tokens", (Query.stats(fa2.entries, 18)).tokens, 13179414)
+
 end -- has_fixtures
 
 ---------------------------------------------------------------------

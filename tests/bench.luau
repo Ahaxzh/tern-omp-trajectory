@@ -1,0 +1,8 @@
+local Parse = require("../lib/parse")
+local Fixtures = require("./fixtures")
+local t0 = os.clock()
+local lines = Parse.split(Fixtures.A_text)
+local t1 = os.clock()
+local parsed = Parse.lines(lines)
+local t2 = os.clock()
+print(string.format("split %.0fms  parse %d entries %.0fms", (t1-t0)*1000, #parsed.entries, (t2-t1)*1000))

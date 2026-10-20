@@ -82,7 +82,7 @@ export type Stats = {
 	model: string?,
 	first_ctx: number?, -- totalTokens of first assistant call
 	last_ctx: number?,
-	spark: { { any } }, -- per assistant call totalTokens: {label, value}
+	spark: { { any } }, -- per assistant call totalTokens: positional {label, value}
 }
 
 function Query.stats(entries: { Entry }, total_rounds: number): Stats
@@ -107,7 +107,9 @@ function Query.stats(entries: { Entry }, total_rounds: number): Stats
 				s.first_ctx = u.total
 			end
 			s.last_ctx = u.total
-			table.insert(s.spark, { label = tostring(n), value = u.total })
+			-- ui.spark takes positional {label, value} pairs.
+			local point: { any } = { tostring(n), u.total }
+			table.insert(s.spark, point)
 		elseif e.kind == "usage" and e.usage ~= nil then
 			local u = e.usage :: Parse.Usage
 			s.aux_calls += 1

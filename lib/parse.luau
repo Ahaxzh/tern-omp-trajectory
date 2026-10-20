@@ -393,7 +393,7 @@ function Parse.line(line: string, seq: number, prev_epoch: number?, raw_keep: bo
 end
 
 ---------------------------------------------------------------------
--- Whole-session assembly
+-- Incremental assembly (budget-friendly batching)
 ---------------------------------------------------------------------
 
 local function merge_tool(target: Entry, patch: Entry)
@@ -422,65 +422,85 @@ local function merge_tool(target: Entry, patch: Entry)
 	end
 end
 
+--- Accumulator for parsing lines across multiple small callbacks (each
+--- callback stays far under the worker budget). Equivalent to Parse.lines.
+export type Acc = {
+	entries: { Entry },
+	by_call: { [string]: Entry },
+	bad: number,
+	meta: Meta,
+	seq: number,
+	prev_epoch: number?,
+}
+
+function Parse.acc(): Acc
+	return { entries = {}, by_call = {}, bad = 0, meta = {}, seq = 0, prev_epoch = nil }
+end
+
+function Parse.push(acc: Acc, line: string)
+	if #string.gsub(line, "%s", "") == 0 then
+		return
+	end
+	acc.seq += 1
+	local ok, added, new_epoch = pcall(Parse.line, line, acc.seq, acc.prev_epoch)
+	if not ok then
+		acc.bad += 1
+		return
+	end
+	acc.prev_epoch = new_epoch
+	for _, e in added :: { Entry } do
+		Parse.absorb(acc, e)
+	end
+end
+
+function Parse.absorb(acc: Acc, e: Entry)
+	if e.kind == "tool" and e.call_id ~= nil then
+		if e.sys_kind == "merge" then
+			local existing = acc.by_call[e.call_id :: string]
+			if existing then
+				merge_tool(existing, e)
+				return
+			end
+			e.pending = false
+			acc.by_call[e.call_id :: string] = e
+			table.insert(acc.entries, e)
+			return
+		end
+		local existing = acc.by_call[e.call_id :: string]
+		if existing then
+			merge_tool(existing, e)
+			return
+		end
+		acc.by_call[e.call_id :: string] = e
+	end
+	if e.sys_kind == "session" then
+		acc.meta.id = e.id
+		acc.meta.cwd = e.sys_detail
+	elseif e.sys_kind == "title" and acc.meta.title == nil and e.sys_detail ~= nil then
+		acc.meta.title = e.sys_detail
+	elseif e.kind == "assistant" and acc.meta.model == nil and e.model ~= nil then
+		acc.meta.model = e.model
+	elseif e.sys_kind == "digest" and e.sys_detail ~= nil then
+		acc.meta.digest = e.sys_detail
+	end
+	table.insert(acc.entries, e)
+end
+
+function Parse.finish(acc: Acc): Parsed
+	return { entries = acc.entries, by_call = acc.by_call, bad = acc.bad, meta = acc.meta }
+end
+
+---------------------------------------------------------------------
+-- Whole-session assembly
+---------------------------------------------------------------------
+
 --- Parses an array of raw JSONL lines into a session.
 function Parse.lines(lines: { string }): Parsed
-	local entries: { Entry } = {}
-	local by_call: { [string]: Entry } = {}
-	local bad = 0
-	local meta: Meta = {}
-	local seq = 0
-	local prev_epoch: number? = nil
-
+	local acc = Parse.acc()
 	for _, line in lines do
-		if #string.gsub(line, "%s", "") == 0 then
-			continue
-		end
-		seq += 1
-		local ok, added, new_epoch = pcall(Parse.line, line, seq, prev_epoch)
-		if not ok then
-			bad += 1
-			continue
-		end
-		prev_epoch = new_epoch
-		for _, e in added :: { Entry } do
-			if e.kind == "tool" and e.call_id ~= nil then
-				if e.sys_kind == "merge" then
-					local existing = by_call[e.call_id :: string]
-					if existing then
-						merge_tool(existing, e)
-						continue
-					end
-					-- Result with no start/call seen (tail window cut it off):
-					-- keep it as its own row.
-					e.pending = false
-					by_call[e.call_id :: string] = e
-					table.insert(entries, e)
-					continue
-				else
-					local existing = by_call[e.call_id :: string]
-					if existing then
-						merge_tool(existing, e)
-						continue
-					end
-					by_call[e.call_id :: string] = e
-				end
-			end
-			-- Session-level metadata.
-			if e.sys_kind == "session" then
-				meta.id = e.id
-				meta.cwd = e.sys_detail
-			elseif e.sys_kind == "title" and meta.title == nil and e.sys_detail ~= nil then
-				meta.title = e.sys_detail
-			elseif e.kind == "assistant" and meta.model == nil and e.model ~= nil then
-				meta.model = e.model
-			elseif e.sys_kind == "digest" and e.sys_detail ~= nil then
-				meta.digest = e.sys_detail
-			end
-			table.insert(entries, e)
-		end
+		Parse.push(acc, line)
 	end
-
-	return { entries = entries, by_call = by_call, bad = bad, meta = meta }
+	return Parse.finish(acc)
 end
 
 --- Splits raw file text into JSONL lines (tolerates a missing final newline
