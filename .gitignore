@@ -1,0 +1,6 @@
+target/
+*.png
+*.webp
+# Real omp session transcripts — private, regenerate locally with
+# tests/gen_fixtures.sh; never commit.
+tests/fixtures.luau

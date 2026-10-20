@@ -1,0 +1,11 @@
+schema = 1
+id = "omp-trajectory"
+name = "OMP Trajectory"
+version = "0.1.0"
+description = "Browse omp session JSONL logs as a trajectory: call ledger, inspectors, token timeline."
+icon = "history"
+host = "host.luau"
+
+[[blocks]]
+id = "trajectory"
+title = "OMP Trajectory"
