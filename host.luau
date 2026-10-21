@@ -64,6 +64,18 @@ type State = {
 	rows: { Row },
 	newest_path: string?,
 	parse_token: number, -- bumps per parse chain; stale chains abort
+	data_version: number, -- bumps when parsed data changes; caches key on it
+	anchor_id: string?, -- row to re-anchor the cursor onto after a prepend
+	list_version: number, -- bumps when the session list/enrichment changes
+	cache_rows_sig: string?,
+	cache_items_sig: string?,
+	cache_items: { Item }?,
+	cache_info_sig: string?,
+	cache_info: Node?,
+	cache_tl_sig: string?,
+	cache_tl: Node?,
+	cache_insp_id: string?,
+	cache_insp: Node?,
 }
 
 local function fresh(): State
@@ -94,6 +106,18 @@ local function fresh(): State
 		rows = {},
 		newest_path = nil,
 		parse_token = 0,
+		data_version = 0,
+		anchor_id = nil,
+		list_version = 0,
+		cache_rows_sig = nil,
+		cache_items_sig = nil,
+		cache_items = nil,
+		cache_info_sig = nil,
+		cache_info = nil,
+		cache_tl_sig = nil,
+		cache_tl = nil,
+		cache_insp_id = nil,
+		cache_insp = nil,
 	}
 end
 
@@ -188,6 +212,7 @@ local function apply_listing(pane: number, sessions: { SessionInfo })
 		st.preselect = nil
 	end
 	st.sel_list = math.clamp(st.sel_list, 1, math.max(1, #sessions))
+	st.list_version += 1
 	render(pane)
 end
 
@@ -435,6 +460,16 @@ local function reset_view_state(st: State)
 	st.total_lines = 0
 	st.truncated = false
 	st.bad = 0
+	st.data_version += 1
+	st.cache_rows_sig = nil
+	st.cache_items_sig = nil
+	st.cache_items = nil
+	st.cache_info_sig = nil
+	st.cache_info = nil
+	st.cache_tl_sig = nil
+	st.cache_tl = nil
+	st.cache_insp_id = nil
+	st.cache_insp = nil
 end
 
 local function load_session(pane: number, mode: "open" | "refresh" | "earlier")
@@ -542,13 +577,41 @@ end
 -- Row helpers
 ---------------------------------------------------------------------
 
-local function rebuild_rows(st: State)
+local function rows_sig(st: State): string
+	return tostring(st.data_version)
+		.. "|"
+		.. tostring(st.win_from)
+		.. "|"
+		.. tostring(st.filter)
+end
+
+--- Rebuilds st.rows only when the underlying data/window/filter changed.
+local function ensure_rows(st: State)
+	local sig = rows_sig(st)
+	if st.cache_rows_sig == sig and st.rows ~= nil then
+		st.sel = math.clamp(st.sel, 1, math.max(1, #st.rows))
+		return
+	end
 	local win: { Round } = {}
 	for i = st.win_from, #st.rounds do
 		table.insert(win, st.rounds[i])
 	end
 	st.rows = View.build_rows(win, st.filter)
+	st.cache_rows_sig = sig
+	st.cache_items_sig = nil -- rows changed -> item list rebuild
 	st.sel = math.clamp(st.sel, 1, math.max(1, #st.rows))
+	if st.follow then
+		st.sel = #st.rows
+	end
+	if st.anchor_id ~= nil then
+		for i, row in st.rows do
+			if row.id == st.anchor_id then
+				st.sel = i
+				break
+			end
+		end
+		st.anchor_id = nil
+	end
 end
 
 local function row_by_id(st: State, id: string): number?
@@ -595,7 +658,6 @@ local function key_view(st: State, key: Key, cx: BlockCx): boolean?
 			st.filter_edit = false
 			st.filter = st.filter_buf
 			st.sel = 1
-			rebuild_rows(st)
 		elseif key.name == "backspace" then
 			st.filter_buf = string.sub(st.filter_buf, 1, -2)
 		elseif key.name == "paste" then
@@ -630,7 +692,6 @@ local function key_view(st: State, key: Key, cx: BlockCx): boolean?
 		elseif st.filter ~= nil then
 			st.filter = nil
 			st.sel = 1
-			rebuild_rows(st)
 		else
 			st.mode = "list"
 		end
@@ -789,16 +850,21 @@ local function list_view(st: State, cx: BlockCx): BlockView
 	elseif #st.sessions == 0 then
 		table.insert(children, ui.text({ ui.span("No omp sessions found in " .. SESSIONS_DIR, "muted") }))
 	else
-		local items, selected = View.session_items(st.sessions, st.sel_list)
-		local listing = ui.list(items)
+		local list_sig = "v" .. tostring(st.list_version)
+		if st.cache_items_sig ~= list_sig or st.cache_items == nil then
+			st.cache_items = View.session_items(st.sessions)
+			st.cache_items_sig = list_sig
+		end
+		local listing = ui.list(st.cache_items :: { Item })
 		local ids: { string } = {}
 		for _, s in st.sessions do
 			table.insert(ids, "s" .. s.name)
 		end
 		View.wire_list(listing, "pick", nil, ids)
+		local sel_id = if st.sessions[st.sel_list] then "s" .. (st.sessions[st.sel_list] :: SessionInfo).name else nil
 		local p: { [string]: any } = listing.p or {}
 		p.key = "sessions"
-		p.selected = if selected then "main.sessions." .. (selected :: string) else nil
+		p.selected = if sel_id then "main.sessions." .. sel_id else nil
 		p.empty = { ui.span("No sessions", "muted") }
 		p.max = { lines = math.max(8, (cx.rows or 24) - 6) }
 		listing.p = p
@@ -816,15 +882,25 @@ local function window_rounds(st: State): { Round }
 end
 
 local function traj_view(st: State, cx: BlockCx): BlockView
-	rebuild_rows(st)
+	ensure_rows(st)
 	local children: { Node } = {}
 	if st.error ~= nil then
 		table.insert(children, ui.text({ ui.span(st.error :: string, "error") }))
 	end
+	local data_sig = tostring(st.data_version) .. "|" .. tostring(st.truncated)
 	if st.stats ~= nil then
-		table.insert(children, View.info(st.stats :: Query.Stats, st.truncated, st.bad))
+		if st.cache_info_sig ~= data_sig or st.cache_info == nil then
+			st.cache_info = View.info(st.stats :: Query.Stats, st.truncated, st.bad)
+			st.cache_info_sig = data_sig
+		end
+		table.insert(children, st.cache_info :: Node)
 	end
-	local timeline = View.timeline(window_rounds(st), TIMELINE_CAP)
+	local tl_sig = data_sig .. "|" .. tostring(st.win_from)
+	if st.cache_tl_sig ~= tl_sig or st.cache_tl == nil then
+		st.cache_tl = View.timeline(window_rounds(st), TIMELINE_CAP)
+		st.cache_tl_sig = tl_sig
+	end
+	local timeline = st.cache_tl
 	if timeline then
 		table.insert(children, timeline)
 	end
@@ -849,12 +925,16 @@ local function traj_view(st: State, cx: BlockCx): BlockView
 	if st.loading and #st.rows == 0 then
 		table.insert(children, ui.text({ ui.span("Loading session …", "muted") }))
 	end
-	local items, selected = View.ledger_items(st.rows, st.sel)
-	local listing = ui.list(items)
+	if st.cache_items_sig ~= rows_sig(st) or st.cache_items == nil then
+		st.cache_items = View.ledger_items(st.rows)
+		st.cache_items_sig = rows_sig(st)
+	end
+	local listing = ui.list(st.cache_items :: { Item })
 	View.wire_list(listing, "row", st.rows, nil)
+	local sel_row = st.rows[st.sel]
 	local p: { [string]: any } = listing.p or {}
 	p.key = "ledger"
-	p.selected = if selected then "main.ledger." .. (selected :: string) else nil
+	p.selected = if sel_row then "main.ledger." .. sel_row.id else nil
 	p.empty = {
 		ui.span(if st.filter ~= nil then "No rows match the filter" else "Empty session", "muted"),
 	}
@@ -862,17 +942,23 @@ local function traj_view(st: State, cx: BlockCx): BlockView
 	listing.p = p
 	table.insert(children, listing)
 
-	-- Expanded inspector, keyed by the entry id for stable diffs.
+	-- Expanded inspector, keyed by the entry id; rebuilt only on change.
 	if st.open_id ~= nil then
-		for _, row in st.rows do
-			if row.row_kind == "entry" and row.entry ~= nil and (row.entry :: Entry).id == st.open_id then
-				local node = View.inspector(row.entry :: Entry)
-				local ip: { [string]: any } = node.p or {}
-				ip.key = "insp-" .. st.open_id
-				node.p = ip
-				table.insert(children, node)
-				break
+		if st.cache_insp_id ~= st.open_id or st.cache_insp == nil then
+			for _, row in st.rows do
+				if row.row_kind == "entry" and row.entry ~= nil and (row.entry :: Entry).id == st.open_id then
+					local node = View.inspector(row.entry :: Entry)
+					local ip: { [string]: any } = node.p or {}
+					ip.key = "insp-" .. st.open_id
+					node.p = ip
+					st.cache_insp = node
+					st.cache_insp_id = st.open_id
+					break
+				end
 			end
+		end
+		if st.cache_insp ~= nil then
+			table.insert(children, st.cache_insp :: Node)
 		end
 	end
 	return { main = ui.col(children), dock = dock_view(st) }

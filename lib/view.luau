@@ -175,12 +175,12 @@ local function entry_value(e: Entry): string?
 	return Query.fmt_clock(e.ts)
 end
 
---- Builds ui.list Items for ledger rows; also sets each item's list child key
---- through `decorate` (the host wires click actions there).
-function View.ledger_items(rows: { Row }, sel: number): ({ Item }, string?)
+--- Builds ui.list Items for ledger rows. Selection is carried by the list's
+--- `selected` prop (not by rewriting labels), so cursor moves diff as a
+--- single property instead of the whole list.
+function View.ledger_items(rows: { Row }): { Item }
 	local items: { Item } = {}
-	local selected_id: string? = nil
-	for i, row in rows do
+	for _, row in rows do
 		local item: Item
 		if row.row_kind == "round" then
 			local r = row.round :: Round
@@ -197,15 +197,10 @@ function View.ledger_items(rows: { Row }, sel: number): ({ Item }, string?)
 				icon = entry_icon(e),
 				tone = kind_tone(e),
 			}
-			if i == sel then
-				selected_id = row.id
-				local lbl: { Span | string } = { ui.span("› ", "accent strong"), (item.label :: any) }
-				item.label = lbl
-			end
 		end
 		table.insert(items, item)
 	end
-	return items, selected_id
+	return items
 end
 
 ---------------------------------------------------------------------
@@ -432,25 +427,17 @@ export type SessionInfo = {
 	mtime: number, -- epoch seconds
 }
 
-function View.session_items(sessions: { SessionInfo }, sel: number): ({ Item }, string?)
+function View.session_items(sessions: { SessionInfo }): { Item }
 	local items: { Item } = {}
-	local selected_id: string? = nil
-	for i, s in sessions do
-		local item: Item = {
+	for _, s in sessions do
+		table.insert(items, {
 			label = Query.clip(s.title or s.name, 80),
 			detail = Query.clip(s.project, 48),
 			value = Query.fmt_size(s.size) .. " · " .. Query.fmt_clock(s.mtime * 1000),
 			icon = "history",
-			tone = nil,
-		}
-		if i == sel then
-			selected_id = "s" .. s.name
-			local lbl: { Span | string } = { ui.span("› ", "accent strong"), Query.clip(s.title or s.name, 78) }
-			item.label = lbl
-		end
-		table.insert(items, item)
+		})
 	end
-	return items, selected_id
+	return items
 end
 
 --- Attaches stable keys and click actions to the children of a ui.list
