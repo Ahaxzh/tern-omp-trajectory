@@ -2,8 +2,12 @@
 -- OMP Trajectory, host half. Block `omp-trajectory.trajectory`:
 -- a session picker over ~/.omp/agent/sessions plus a trajectory ledger for
 -- one session JSONL (round-grouped call flow, inspectors, timeline).
--- All file IO is async (process callbacks); handlers stay inside the 2s
--- worker budget. State lives in the block; persistence via save/tern.kv.
+--
+-- IO design: the normal open/refresh/earlier path uses ZERO child processes
+-- (tern.fs.read + batch-chained parsing). The worker's process hook is only
+-- touched by two rare fallbacks (oversize files, optional list enrichment),
+-- so one contended spike can no longer freeze the block: file reads are
+-- ~10-30 ms of worker time and parsing runs in ~120-line timer ticks.
 
 local Parse = require("./lib/parse")
 local Query = require("./lib/query")
@@ -17,10 +21,12 @@ type SessionInfo = View.SessionInfo
 local ui = tern.ui
 
 local SESSIONS_DIR = (tern.getenv("HOME") or "") .. "/.omp/agent/sessions"
-local CHUNK_BYTES = 1024 * 1024 -- tail window parsed at open / per page
+local CHUNK_BYTES = 1024 * 1024 -- tail window parsed at open / per earlier page
+local FULL_LIMIT = 8 * 1024 * 1024 -- never read/parse more than this whole
 local TAIL_ROUNDS = 50 -- rounds shown initially
 local WATCH_MS = 60 * 1000 -- active-session refresh interval
 local TIMELINE_CAP = 32 -- chips in the timeline strip
+local PARSE_BATCH = 60 -- lines per chained callback (~15-40 ms)
 
 ---------------------------------------------------------------------
 -- State
@@ -49,10 +55,10 @@ type State = {
 	filter: string?, -- applied filter
 	filter_edit: boolean,
 	filter_buf: string,
-	file_size: number,
-	stream_upto: number, -- byte offset after the last complete parsed line
-	loaded_from: number, -- first byte offset of loaded data (1-based)
 	truncated: boolean,
+	parsed_lines: number, -- lines of the current file parsed so far
+	first_window_line: number, -- 1-based first line of the loaded window
+	total_lines: number, -- line count at the last full read
 	stats: Query.Stats?,
 	-- derived per render
 	rows: { Row },
@@ -80,10 +86,10 @@ local function fresh(): State
 		filter = nil,
 		filter_edit = false,
 		filter_buf = "",
-		file_size = 0,
-		stream_upto = 0,
-		loaded_from = 1,
 		truncated = false,
+		parsed_lines = 0,
+		first_window_line = 1,
+		total_lines = 0,
 		stats = nil,
 		rows = {},
 		newest_path = nil,
@@ -120,9 +126,12 @@ local function render(pane: number)
 end
 
 ---------------------------------------------------------------------
--- Session listing (one python3 spawn; titles from the file heads)
+-- Session listing (pure fs; titles/sizes enriched by one optional spawn)
 ---------------------------------------------------------------------
 
+-- Titles and sizes need file heads, which tern.fs cannot do partially; one
+-- python3 pass fills them in. If the hook is disabled or the spawn fails,
+-- the list simply stays name-only and everything else keeps working.
 local LIST_PY = [[
 import os, sys, json, glob
 base = os.path.expanduser("~/.omp/agent/sessions")
@@ -158,90 +167,123 @@ out.sort(key=lambda x: -x["mtime"])
 sys.stdout.write(json.dumps(out))
 ]]
 
+local function apply_listing(pane: number, sessions: { SessionInfo })
+	local r = reg[pane]
+	if r == nil then
+		return
+	end
+	local st = r.st
+	st.sessions = sessions
+	st.listing = false
+	if #sessions > 0 then
+		st.newest_path = sessions[1].path
+	end
+	if st.preselect ~= nil then
+		for i, s in sessions do
+			if s.path == st.preselect then
+				st.sel_list = i
+				break
+			end
+		end
+		st.preselect = nil
+	end
+	st.sel_list = math.clamp(st.sel_list, 1, math.max(1, #sessions))
+	render(pane)
+end
+
+--- Immediate, spawn-free listing: names only (file names carry the UTC
+--- start timestamp, so name order is chronological). Titles and sizes fill
+--- in later from the enrichment pass when it succeeds.
+local function list_sessions_fs(pane: number)
+	local r = reg[pane]
+	if r == nil then
+		return
+	end
+	local sessions: { SessionInfo } = tern.json.array({})
+	local ok, dirs = pcall(tern.fs.list, SESSIONS_DIR)
+	if ok and type(dirs) == "table" then
+		for _, proj in dirs :: { string } do
+			local okd, files = pcall(tern.fs.list, SESSIONS_DIR .. "/" .. proj)
+			if okd and type(files) == "table" then
+				for _, f in files :: { string } do
+					if #f > 6 and string.sub(f, -6) == ".jsonl" then
+						table.insert(sessions, {
+							path = SESSIONS_DIR .. "/" .. proj .. "/" .. f,
+							project = proj,
+							name = f,
+							title = nil,
+							size = 0,
+							mtime = 0,
+						})
+					end
+				end
+			end
+		end
+	end
+	table.sort(sessions, function(a: SessionInfo, b: SessionInfo)
+		return a.name > b.name
+	end)
+	apply_listing(pane, sessions)
+end
+
+--- Optional enrichment (titles, sizes, mtimes) via one python3 spawn.
+local function enrich_listing(pane: number)
+	local r = reg[pane]
+	if r == nil or #r.st.sessions == 0 or #r.st.sessions > 80 then
+		return
+	end
+	tern.process.run({ "python3", "-c", LIST_PY }, { timeout_ms = 15000 }, function(res)
+		local r = reg[pane]
+		if r == nil or res.status ~= 0 then
+			return -- name-only list stays; nothing else depends on this
+		end
+		local ok, data = pcall(tern.json.decode, res.stdout)
+		if not ok or type(data) ~= "table" then
+			return
+		end
+		local st = r.st
+		for _, item in data :: { any } do
+			if type(item) == "table" then
+				local it = item :: any
+				for _, s in st.sessions do
+					if s.path == it.path then
+						if type(it.title) == "string" and it.title ~= "" then
+							s.title = it.title
+						end
+						s.size = tonumber(it.size) or s.size
+						s.mtime = tonumber(it.mtime) or s.mtime
+						break
+					end
+				end
+			end
+		end
+		render(pane)
+	end)
+end
+
 local function start_listing(pane: number)
 	local r = reg[pane]
 	if r == nil then
 		return
 	end
 	r.st.listing = true
-	tern.process.run({ "python3", "-c", LIST_PY }, { timeout_ms = 10000 }, function(res)
-		local r = reg[pane]
-		if r == nil then
-			return
-		end
-		local st = r.st
-		st.listing = false
-		if res.status ~= 0 then
-			st.error = "session listing failed: "
-				.. (if res.stderr ~= "" then res.stderr else "exit " .. tostring(res.status))
-			render(pane)
-			return
-		end
-		local ok, data = pcall(tern.json.decode, res.stdout)
-		if not ok or type(data) ~= "table" then
-			st.error = "session listing unreadable"
-			render(pane)
-			return
-		end
-		local sessions: { SessionInfo } = tern.json.array({})
-		for _, item in data :: { any } do
-			if type(item) == "table" and type((item :: any).path) == "string" then
-				local it = item :: any
-				table.insert(sessions, {
-					path = it.path,
-					project = tostring(it.project or ""),
-					name = tostring(it.name or ""),
-					title = if type(it.title) == "string" and it.title ~= "" then it.title else nil,
-					size = tonumber(it.size) or 0,
-					mtime = tonumber(it.mtime) or 0,
-				})
-			end
-		end
-		st.sessions = sessions
-		st.error = nil
-		if #sessions > 0 then
-			st.newest_path = sessions[1].path
-		end
-		if st.preselect ~= nil then
-			for i, s in sessions do
-				if s.path == st.preselect then
-					st.sel_list = i
-					break
-				end
-			end
-			st.preselect = nil
-		end
-		st.sel_list = math.clamp(st.sel_list, 1, math.max(1, #sessions))
-		render(pane)
-	end)
+	render(pane)
+	list_sessions_fs(pane)
+	enrich_listing(pane)
 end
 
 ---------------------------------------------------------------------
--- Session loading (chunked, tail-first)
+-- Session loading (spawn-free; batch-chained parsing)
 ---------------------------------------------------------------------
 
-local schedule_watch -- forward: open_session re-arms the watcher
-
-local function stat_size(pane: number, path: string, cb: (number?) -> ())
-	tern.process.run({ "wc", "-c", path }, { timeout_ms = 5000 }, function(res)
-		if reg[pane] == nil then
-			return
-		end
-		local n = tonumber((string.gsub(res.stdout, "^%s*(%d+).*", "%1")))
-		cb(if res.status == 0 then n else nil)
-	end)
-end
-
---- Byte offset of the last newline in `text` (0 when none).
-local function last_newline(text: string): number
-	local i = #text
-	while i > 0 do
-		if string.byte(text, i) == 10 then
-			return i
-		end
-		i -= 1
+--- Whole-file read guarded by FULL_LIMIT. nil means the file is larger
+--- (or unreadable) and the rare spawn-based fallback must handle it.
+local function read_whole(path: string): string?
+	local ok, text = pcall(tern.fs.read, path, FULL_LIMIT)
+	if ok and type(text) == "string" then
+		return text
 	end
-	return 0
+	return nil
 end
 
 local function round_count(st: State): number
@@ -254,16 +296,13 @@ local function round_count(st: State): number
 	return n
 end
 
-local PARSE_BATCH = 120 -- lines per chained callback (~25 ms; the 2 s budget
--- is wall-clock and one contended spike once disabled the whole hook, so
--- every callback stays small by construction)
-
---- Parses `text` in small chained callbacks, then applies it to the state.
---- Stale chains (a newer open/reload) abort themselves via parse_token.
-local function start_parse(
+--- Parses lines[from..to] in small chained callbacks, then applies the
+--- result to the state. Stale chains abort via parse_token.
+local function chain_parse(
 	pane: number,
-	text: string,
-	base_byte: number,
+	lines: { string },
+	from_line: number,
+	to_line: number,
 	mode: "replace" | "prepend",
 	pin_tail: boolean?
 )
@@ -272,7 +311,6 @@ local function start_parse(
 		return
 	end
 	local st = r.st
-	local lines = Parse.split(text)
 	local acc = Parse.acc()
 	local anchor_id: string? = nil
 	if mode == "prepend" then
@@ -281,7 +319,7 @@ local function start_parse(
 	end
 	st.parse_token += 1
 	local token = st.parse_token
-	local pos = 0
+	local pos = from_line - 1
 
 	local function finish()
 		local r = reg[pane]
@@ -289,9 +327,7 @@ local function start_parse(
 			return
 		end
 		local st = r.st
-		local f0 = tern.now()
 		local parsed = Parse.finish(acc)
-		local f1 = tern.now()
 		if mode == "replace" then
 			st.entries = parsed.entries
 			st.bad = parsed.bad
@@ -299,8 +335,9 @@ local function start_parse(
 			st.win_from = Query.tail_from(st.rounds, TAIL_ROUNDS)
 			st.stats = Query.stats(st.entries, round_count(st))
 			st.follow = true
+			st.parsed_lines = to_line
 		else
-			local rounds_before2 = #st.rounds
+			local rounds_before = #st.rounds
 			local merged: { Entry } = tern.json.array({})
 			for _, e in parsed.entries do
 				table.insert(merged, e)
@@ -310,32 +347,18 @@ local function start_parse(
 			end
 			st.entries = merged
 			st.bad += parsed.bad
-			local f2 = tern.now()
 			st.rounds = Query.rounds(st.entries)
-			local f3 = tern.now()
 			if pin_tail and st.follow then
 				st.win_from = Query.tail_from(st.rounds, TAIL_ROUNDS)
 			else
-				st.win_from = math.max(1, st.win_from + (#st.rounds - rounds_before2))
+				st.win_from = math.max(1, st.win_from + (#st.rounds - rounds_before))
 			end
 			st.stats = Query.stats(st.entries, round_count(st))
-			local f4 = tern.now()
 			local win: { Round } = {}
 			for i = st.win_from, #st.rounds do
 				table.insert(win, st.rounds[i])
 			end
 			st.rows = View.build_rows(win, st.filter)
-			local f5 = tern.now()
-			tern.log.warn(
-				"probe finish",
-				mode,
-				math.floor((f1 - f0) * 1),
-				math.floor(f2 - f1),
-				math.floor(f3 - f2),
-				math.floor(f4 - f3),
-				math.floor(f5 - f4),
-				"ms"
-			)
 			if st.follow then
 				st.sel = #st.rows
 			elseif anchor_id ~= nil then
@@ -347,10 +370,9 @@ local function start_parse(
 					end
 				end
 			end
+			st.parsed_lines = math.max(st.parsed_lines, to_line)
 		end
-		-- Byte offset after the last complete line (a trailing partial line
-		-- is reparsed on the next watch tick).
-		st.stream_upto = (base_byte - 1) + last_newline(text)
+		st.total_lines = math.max(st.total_lines, to_line)
 		st.loading = false
 		render(pane)
 	end
@@ -361,86 +383,42 @@ local function start_parse(
 			return -- superseded by a newer open/reload, or block gone
 		end
 		local from = pos + 1
-		local to = math.min(#lines, from + PARSE_BATCH - 1)
+		local to = math.min(to_line, from + PARSE_BATCH - 1)
 		for i = from, to do
 			Parse.push(acc, lines[i])
 		end
 		pos = to
-		if pos < #lines then
+		if pos < to_line then
 			tern.timer(0, tick)
 		else
 			finish()
 		end
 	end
 
-	if #lines == 0 then
+	if from_line > to_line then
 		finish()
 	else
+		st.loading = true
 		tern.timer(0, tick)
 	end
 end
 
-local function drop_first_line(text: string): string
-	local i = string.find(text, "\n", 1, true)
-	return if i then string.sub(text, (i :: number) + 1) else ""
+--- First line index of a window ending at `end_line` covering about
+--- CHUNK_BYTES (walks line lengths backward; lengths only, no parsing).
+local function window_start(lines: { string }, end_line: number): number
+	local bytes = 0
+	local i = end_line
+	while i > 0 do
+		bytes += #lines[i] + 1
+		if bytes >= CHUNK_BYTES then
+			break
+		end
+		i -= 1
+	end
+	return math.max(1, i)
 end
 
-local function load_tail(pane: number)
-	local r = reg[pane]
-	if r == nil or r.st.path == nil then
-		return
-	end
-	local st = r.st
-	local path = st.path :: string
-	local size = st.file_size
-	local want = math.min(size, CHUNK_BYTES)
-	local from = math.max(1, size - want + 1)
-	st.loaded_from = from
-	st.truncated = from > 1
-	st.loading = true
-	if from <= 1 then
-		-- Small file: read off-thread like every other path so no callback
-		-- ever pays for disk IO.
-		tern.process.run({ "cat", path }, { timeout_ms = 8000 }, function(res)
-			local r = reg[pane]
-			if r == nil or r.st.path ~= path then
-				return
-			end
-			r.st.loading = false
-			if res.status ~= 0 then
-				r.st.error = "read failed: " .. res.stderr
-			else
-				r.st.error = nil
-				start_parse(pane, res.stdout, 1, "replace")
-			end
-			render(pane)
-		end)
-		return
-	end
-	tern.process.run({ "tail", "-c", "+" .. tostring(from), path }, { timeout_ms = 8000 }, function(res)
-		local r = reg[pane]
-		if r == nil or r.st.path ~= path then
-			return
-		end
-		r.st.loading = false
-		if res.status ~= 0 then
-			r.st.error = "read failed: " .. res.stderr
-		else
-			r.st.error = nil
-			start_parse(pane, drop_first_line(res.stdout), from, "replace")
-		end
-		render(pane)
-	end)
-end
-
-local function open_session(pane: number, path: string)
-	local r = reg[pane]
-	if r == nil then
-		return
-	end
-	local st = r.st
-	st.mode = "view"
-	st.path = path
+local function reset_view_state(st: State)
 	st.error = nil
 	st.entries = {}
 	st.rounds = {}
@@ -452,70 +430,64 @@ local function open_session(pane: number, path: string)
 	st.filter = nil
 	st.filter_edit = false
 	st.filter_buf = ""
-	st.file_size = 0
-	st.stream_upto = 0
-	st.loaded_from = 1
+	st.parsed_lines = 0
+	st.first_window_line = 1
+	st.total_lines = 0
 	st.truncated = false
 	st.bad = 0
-	tern.kv.set("last", path)
-	schedule_watch(pane)
-	stat_size(pane, path, function(n)
-		local r = reg[pane]
-		if r == nil or r.st.path ~= path then
-			return
-		end
-		if n == nil then
-			r.st.error = "cannot stat session file"
-			render(pane)
-			return
-		end
-		r.st.file_size = n :: number
-		load_tail(pane)
-	end)
 end
 
-local function load_earlier(pane: number)
+local function load_session(pane: number, mode: "open" | "refresh" | "earlier")
 	local r = reg[pane]
 	if r == nil or r.st.path == nil then
 		return
 	end
 	local st = r.st
-	if st.loaded_from <= 1 then
+	local path = st.path :: string
+
+	local text = read_whole(path)
+	if text == nil then
+		st.loading = false
+		st.error = "session file exceeds the 8 MB guard; open it with omp or trim it first"
+		render(pane)
 		return
 	end
-	local path = st.path :: string
-	local b = st.loaded_from
-	local a = math.max(1, b - CHUNK_BYTES)
-	st.loading = true
-	local cmd = string.format("tail -c +%d %q | head -c %d", a, path, b - a)
-	tern.process.run({ "sh", "-c", cmd }, { timeout_ms = 8000 }, function(res)
-		local r = reg[pane]
-		if r == nil or r.st.path ~= path then
+	local lines = Parse.split(text)
+	st.total_lines = #lines
+
+	if mode == "earlier" then
+		local stop = st.first_window_line - 1
+		if stop <= 0 then
+			st.loading = false
 			return
 		end
-		r.st.loading = false
-		if res.status ~= 0 then
-			r.st.error = "read failed: " .. res.stderr
-		else
-			r.st.error = nil
-			r.st.loaded_from = a
-			r.st.truncated = a > 1
-			local text = res.stdout
-			if a > 1 then
-				text = drop_first_line(text)
-			end
-			-- BISECTION 3: state flip + parse chain, NO render here (the
-			-- chain's finish renders once)
-			start_parse(pane, text, a, "prepend")
+		local startl = window_start(lines, stop)
+		st.first_window_line = startl
+		st.truncated = startl > 1
+		chain_parse(pane, lines, startl, stop, "prepend")
+		return
+	end
+
+	if mode == "refresh" and st.parsed_lines > 0 and #lines >= st.parsed_lines then
+		-- Incremental: parse only the appended lines.
+		if #lines > st.parsed_lines then
+			chain_parse(pane, lines, st.parsed_lines + 1, #lines, "prepend", true)
 		end
-	end)
+		return
+	end
+
+	-- Full (re)open: last window of the file.
+	local startl = window_start(lines, #lines)
+	st.first_window_line = startl
+	st.truncated = startl > 1
+	chain_parse(pane, lines, startl, #lines, "replace")
 end
 
 ---------------------------------------------------------------------
--- Active-session watch: incremental refresh of the newest file
+-- Active-session watch: incremental refresh of the open file
 ---------------------------------------------------------------------
 
-schedule_watch = function(pane: number)
+local function schedule_watch(pane: number)
 	local r = reg[pane]
 	if r == nil then
 		return
@@ -534,45 +506,37 @@ schedule_watch = function(pane: number)
 			return
 		end
 		local st = r.st
-		if st.mode ~= "view" or st.path == nil or st.path ~= st.newest_path then
+		if st.mode ~= "view" or st.path == nil then
 			return -- chain stops; opening a session re-arms it
 		end
-		local path = st.path :: string
-		stat_size(pane, path, function(n)
-			local r = reg[pane]
-			if r == nil then
-				return
-			end
-			local st = r.st
-			if n ~= nil and (n :: number) >= st.file_size and st.file_size > 0 and st.stream_upto >= st.file_size then
-				-- Clean incremental read from the last complete line.
-				local size = n :: number
-				if size > st.file_size then
-					local from = st.stream_upto + 1
-					tern.process.run({ "tail", "-c", "+" .. tostring(from), path }, { timeout_ms = 8000 }, function(res)
-						local r = reg[pane]
-						if r == nil or r.st.path ~= path then
-							return
-						end
-						if res.status == 0 then
-							r.st.file_size = size
-							start_parse(pane, res.stdout, from, "prepend", true)
-						end
-						render(pane)
-					end)
-				end
-			else
-				-- First stat after open, shrunk file, or a partial trailing
-				-- line: reparse the tail window whole.
-				if n ~= nil then
-					st.file_size = n :: number
-					load_tail(pane)
-				end
-			end
-			schedule_watch(pane)
-		end)
+		load_session(pane, "refresh")
+		schedule_watch(pane)
 	end)
 end
+
+local function open_session(pane: number, path: string)
+	local r = reg[pane]
+	if r == nil then
+		return
+	end
+	local st = r.st
+	st.mode = "view"
+	st.path = path
+	reset_view_state(st)
+	tern.kv.set("last", path)
+	schedule_watch(pane)
+	load_session(pane, "open")
+	render(pane)
+end
+
+local function load_earlier(pane: number)
+	local r = reg[pane]
+	if r == nil or r.st.path == nil or r.st.truncated == false then
+		return
+	end
+	load_session(pane, "earlier")
+end
+
 
 ---------------------------------------------------------------------
 -- Row helpers
@@ -791,8 +755,10 @@ local function dock_view(st: State): Node
 		if st.mode == "view" then
 			add("f", "")
 			add(" filter" .. (if st.filter ~= nil then " (" .. (st.filter :: string) .. ")" else "") .. " · ", "muted")
-			add("h", "")
-			add(if st.truncated then " earlier · " else " · ", "muted")
+			if st.truncated then
+				add("h", "")
+				add(" earlier · ", "muted")
+			end
 			add("r", "")
 			add(" reload · ", "muted")
 			add("esc", "")
@@ -870,7 +836,12 @@ local function traj_view(st: State, cx: BlockCx): BlockView
 		more.p = mp
 		table.insert(children, ui.row({ more, ui.text({
 			ui.span(
-				string.format("showing bytes %d–%d of %d", st.loaded_from, st.file_size, st.file_size),
+				string.format(
+					"showing lines %d–%d of %d",
+					st.first_window_line,
+					st.total_lines,
+					st.total_lines
+				),
 				"muted"
 			),
 		}) }))
@@ -904,9 +875,12 @@ local function traj_view(st: State, cx: BlockCx): BlockView
 			end
 		end
 	end
-	local dock = dock_view(st)
-	return { main = ui.col(children), dock = dock }
+	return { main = ui.col(children), dock = dock_view(st) }
 end
+
+---------------------------------------------------------------------
+-- Block definition
+---------------------------------------------------------------------
 
 local block: BlockDef<State> = {
 	init = function(cx, _args, saved)
